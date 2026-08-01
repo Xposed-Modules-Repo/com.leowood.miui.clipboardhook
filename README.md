@@ -2,23 +2,25 @@
 
 针对 Redmi K80 Pro / HyperOS 2 国行版的实验性 LSPosed 模块。
 
-目标是验证并绕过关闭系统优化后，小米互联服务无法完成后台剪贴板唤醒和注册的问题。模块不修改小米账号、可信设备数据库或剪贴板内容。
+目标是在关闭系统优化后，定向修复小米互联剪贴板的后台唤醒检查。模块不修改小米账号、可信设备数据库或剪贴板内容，也不伪装 `persist.sys.miui_optimization`。
 
 ## 当前版本
 
-`0.1.1-probe` 是诊断和最小化绕过版本：
+`0.2.0-scope` 是收紧范围后的版本：
 
-- 在 `com.miui.mishare.connectivity`、`com.milink.service`、`com.xiaomi.mi_connect_service` 和 `com.xiaomi.mirror` 中，将读取 `persist.sys.miui_optimization` 的结果定向视为 `true`。
-- 在 `android` 的候选剪贴板服务中，仅当调用方包名（第一个参数）属于上述包且检查结果为 `false` 时，放行唤醒/权限所有者检查。
-- 不修改全局系统属性，不改变其他应用的系统优化状态。
+- 只在 `android`（system_server）作用域运行。
+- 只尝试精确方法 `com.android.server.clipboard.ClipboardServiceStubImpl#checkProviderWakePathForClipboard(String, int, ProviderInfo, int)`。
+- 只接受 `boolean` 返回值、四个精确参数类型且非静态的方法；找不到该签名时只记录日志，不扫描其他方法。
+- 只有调用方属于小米互联白名单，且 Provider 身份属于已验证的短语输入/互联 Provider 时，才把 `false` 改为 `true`。
+- 不再 Hook `SystemProperties`，因此不会影响互联进程读取 `persist.sys.miui_optimization` 的结果。
+- 成功放行日志只记录调用方包名、UID、Provider 名称和方法名；详细反射签名由源码中的 `DEBUG` 开关控制，正式版默认关闭。
 
 ## 安装
 
 1. 构建并安装 APK。
-2. 在 LSPosed 中启用模块。
-3. 勾选作用域：Android System、互联互通服务、小米互联通信服务、小米镜像服务。
-4. 重启手机。
-5. 保持系统优化关闭，测试手机和电脑之间复制纯文本。
+2. 在 LSPosed 中启用模块，只勾选 `Android System`。
+3. 重启手机。
+4. 保持系统优化关闭，测试手机和电脑之间复制纯文本。
 
 查看日志：
 

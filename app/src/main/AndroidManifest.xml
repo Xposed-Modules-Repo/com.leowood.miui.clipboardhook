@@ -9,7 +9,7 @@
             android:value="true" />
         <meta-data
             android:name="xposeddescription"
-            android:value="在关闭系统优化时，定向放行小米互联剪贴板的后台访问和优化检查。" />
+            android:value="在关闭系统优化时，定向放行小米互联剪贴板的后台唤醒检查。" />
         <meta-data
             android:name="xposedminversion"
             android:value="93" />

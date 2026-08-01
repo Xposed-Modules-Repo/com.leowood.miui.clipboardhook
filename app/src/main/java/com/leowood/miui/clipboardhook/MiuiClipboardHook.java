@@ -1,9 +1,9 @@
 package com.leowood.miui.clipboardhook;
 
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.Arrays;
 import java.util.HashSet;
-import java.util.Locale;
 import java.util.Set;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -15,180 +15,178 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * Narrow LSPosed compatibility hook for the HyperOS 2 MIUI+ clipboard path.
  *
- * The phone-side investigation showed that clipboard settings and app-ops are
- * already enabled. The remaining failure is the background/provider wake path
- * and the continuity services' read of persist.sys.miui_optimization.
- *
- * This build is deliberately diagnostic and narrow:
- * - only the listed Xiaomi continuity packages are affected;
- * - the system_server hook only changes a false boolean when the call carries
- *   one of those package names;
- * - no account, pairing database, or clipboard content is modified.
+ * The verified failure point is
+ * ClipboardServiceStubImpl#checkProviderWakePathForClipboard(String, int,
+ * ProviderInfo, int). This module only hooks that exact method and only turns
+ * a false result into true for an allow-listed continuity caller/provider pair.
  */
 public final class MiuiClipboardHook implements IXposedHookLoadPackage {
     private static final String TAG = "[MiuiClipboardHook] ";
-    private static final String OPTIMIZATION_KEY = "persist.sys.miui_optimization";
+    private static final boolean DEBUG = false;
+
+    private static final String CLIPBOARD_CLASS =
+            "com.android.server.clipboard.ClipboardServiceStubImpl";
+    private static final String CLIPBOARD_METHOD = "checkProviderWakePathForClipboard";
+    private static final String EXPECTED_PROVIDER_PARAMETER = "android.content.pm.ProviderInfo";
+
     private static final Set<String> CONTINUITY_PACKAGES = new HashSet<>(Arrays.asList(
             "com.miui.mishare.connectivity",
             "com.milink.service",
             "com.xiaomi.mi_connect_service",
             "com.xiaomi.mirror"));
+
+    /* Exact provider identities observed on the target HyperOS build. */
+    private static final Set<String> ALLOWED_PROVIDER_IDENTITIES = new HashSet<>(Arrays.asList(
+            "com.miui.phrase.input.provider",
+            "com.miui.provider.InputProvider",
+            "com.miui.mishare.connectivity",
+            "com.milink.service",
+            "com.xiaomi.mi_connect_service",
+            "com.xiaomi.mirror"));
+
     private static final Set<String> HOOKED = new HashSet<>();
     private static final Set<String> LOGGED = new HashSet<>();
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-        try {
-            if ("android".equals(lpparam.packageName)) {
-                installSystemServerHooks(lpparam.classLoader);
-                return;
-            }
+        if (!"android".equals(lpparam.packageName)) {
+            return;
+        }
 
-            if (CONTINUITY_PACKAGES.contains(lpparam.packageName)) {
-                installContinuityProcessHooks(lpparam.classLoader, lpparam.packageName,
-                        lpparam.processName);
-            }
+        try {
+            installSystemServerHook(lpparam.classLoader);
         } catch (Throwable error) {
-            log("load failure package=" + lpparam.packageName + " error=" + describe(error));
+            log("system_server hook failure error=" + describe(error));
         }
     }
 
-    private static void installContinuityProcessHooks(
-            ClassLoader loader, String packageName, String processName) {
-        log("loaded continuity package=" + packageName + " process=" + processName);
-        hookOptimizationProperty(loader, packageName);
-    }
-
-    private static void hookOptimizationProperty(ClassLoader loader, String packageName) {
-        Class<?> properties = XposedHelpers.findClassIfExists("android.os.SystemProperties", loader);
-        if (properties == null) {
-            log("SystemProperties not found package=" + packageName);
+    private static void installSystemServerHook(ClassLoader loader) {
+        Class<?> type = XposedHelpers.findClassIfExists(CLIPBOARD_CLASS, loader);
+        if (type == null) {
+            log("exact clipboard class not found class=" + CLIPBOARD_CLASS);
             return;
         }
 
-        hookPropertyGetter(properties, "getBoolean", packageName);
-        hookPropertyGetter(properties, "get", packageName);
-    }
-
-    private static void hookPropertyGetter(Class<?> properties, String methodName, String packageName) {
-        String key = properties.getName() + "#" + methodName + ":" + packageName;
-        if (!HOOKED.add(key)) {
+        Method method = findExactClipboardMethod(type);
+        if (method == null) {
+            log("exact clipboard method not found class=" + CLIPBOARD_CLASS
+                    + " method=" + CLIPBOARD_METHOD
+                    + " expected=(String,int," + EXPECTED_PROVIDER_PARAMETER + ",int)boolean");
             return;
         }
 
-        Set<XC_MethodHook.Unhook> unhooks = XposedBridge.hookAllMethods(
-                properties,
-                methodName,
-                new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        if (param.args == null || param.args.length == 0
-                                || !OPTIMIZATION_KEY.equals(String.valueOf(param.args[0]))) {
-                            return;
-                        }
-
-                        if ("getBoolean".equals(methodName)
-                                && param.getResult() instanceof Boolean
-                                && !((Boolean) param.getResult())) {
-                            param.setResult(true);
-                            logOnce("property:" + packageName,
-                                    "forced optimization=true package=" + packageName);
-                        } else if ("get".equals(methodName)
-                                && param.getResult() instanceof String
-                                && "false".equalsIgnoreCase((String) param.getResult())) {
-                            param.setResult("true");
-                            logOnce("property-string:" + packageName,
-                                    "forced optimization string=true package=" + packageName);
-                        }
-                    }
-                });
-        log("hooked " + key + " overloads=" + unhooks.size());
+        hookClipboardMethod(method);
     }
 
-    private static void installSystemServerHooks(ClassLoader loader) {
-        log("loaded system_server hook");
-
-        String[] candidates = new String[]{
-                "com.android.server.clipboard.ClipboardService",
-                "com.android.server.clipboard.ClipboardServiceImpl",
-                "com.android.server.clipboard.ClipboardServiceI",
-                "com.android.server.clipboard.MiuiClipboardService",
-                "com.android.server.clipboard.ClipboardServiceStub",
-                "com.android.server.clipboard.ClipboardServiceStubImpl"};
-
-        for (String className : candidates) {
-            Class<?> type = XposedHelpers.findClassIfExists(className, loader);
-            if (type == null) {
-                continue;
-            }
-            log("clipboard class found=" + className);
-            hookClipboardWakeMethods(type);
-        }
-    }
-
-    private static void hookClipboardWakeMethods(Class<?> type) {
+    private static Method findExactClipboardMethod(Class<?> type) {
+        Method match = null;
         for (Method method : type.getDeclaredMethods()) {
-            String name = method.getName().toLowerCase(Locale.ROOT);
-            if (!name.contains("wake") && !name.contains("permissionowner")) {
+            if (!CLIPBOARD_METHOD.equals(method.getName()) || !isExactSignature(method)) {
                 continue;
             }
-            hookClipboardMethod(type, method.getName());
+            if (match != null) {
+                log("ambiguous exact clipboard method class=" + type.getName());
+                return null;
+            }
+            match = method;
         }
+        return match;
     }
 
-    private static void hookClipboardMethod(Class<?> type, String methodName) {
-        String key = type.getName() + "#" + methodName;
+    private static boolean isExactSignature(Method method) {
+        if (Modifier.isStatic(method.getModifiers())
+                || method.getReturnType() != boolean.class) {
+            return false;
+        }
+
+        Class<?>[] parameters = method.getParameterTypes();
+        return parameters.length == 4
+                && parameters[0] == String.class
+                && parameters[1] == int.class
+                && EXPECTED_PROVIDER_PARAMETER.equals(parameters[2].getName())
+                && parameters[3] == int.class;
+    }
+
+    private static void hookClipboardMethod(final Method method) {
+        String key = method.getDeclaringClass().getName() + "#" + method.getName()
+                + methodSignature(method);
         if (!HOOKED.add(key)) {
             return;
         }
 
         try {
-            Set<XC_MethodHook.Unhook> unhooks = XposedBridge.hookAllMethods(
-                    type,
-                    methodName,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            if (!(param.getResult() instanceof Boolean)
-                                    || (Boolean) param.getResult()
-                                    || !isContinuityCaller(param.args)) {
-                                return;
-                            }
+            XposedBridge.hookMethod(method, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    if (!(param.getResult() instanceof Boolean)
+                            || (Boolean) param.getResult()
+                            || param.args == null
+                            || param.args.length != 4
+                            || !(param.args[0] instanceof String)
+                            || !(param.args[1] instanceof Integer)
+                            || !isContinuityCaller((String) param.args[0])
+                            || !isAllowedProvider(param.args[2])) {
+                        return;
+                    }
 
-                            param.setResult(true);
-                            log("clipboard wake check false->true method="
-                                    + methodName + " args=" + summarizeArgs(param.args));
-                        }
-                    });
-            log("hooked clipboard method=" + key + " overloads=" + unhooks.size());
+                    String callerPackage = (String) param.args[0];
+                    int callerUid = (Integer) param.args[1];
+                    String providerName = providerName(param.args[2]);
+                    param.setResult(true);
+                    logOnce("allow:" + callerPackage + ":" + callerUid + ":" + providerName,
+                            "clipboard wake check false->true callerPackage=" + callerPackage
+                                    + " callerUid=" + callerUid
+                                    + " providerName=" + providerName
+                                    + " method=" + method.getName());
+                }
+            });
+            log("hooked exact clipboard method=" + key);
         } catch (Throwable error) {
             log("clipboard hook failed=" + key + " error=" + describe(error));
         }
     }
 
-    private static boolean isContinuityCaller(Object[] args) {
-        if (args == null || args.length == 0 || args[0] == null) {
-            return false;
-        }
-        return CONTINUITY_PACKAGES.contains(String.valueOf(args[0]));
+    private static boolean isContinuityCaller(String callerPackage) {
+        return CONTINUITY_PACKAGES.contains(callerPackage);
     }
 
-    private static String summarizeArgs(Object[] args) {
-        if (args == null) {
-            return "[]";
+    private static boolean isAllowedProvider(Object provider) {
+        if (provider == null) {
+            return false;
         }
-        StringBuilder out = new StringBuilder("[");
-        for (int i = 0; i < args.length; i++) {
-            if (i > 0) {
-                out.append(", ");
-            }
-            String text = String.valueOf(args[i]);
-            if (text.length() > 160) {
-                text = text.substring(0, 160) + "…";
-            }
-            out.append(text);
+        return ALLOWED_PROVIDER_IDENTITIES.contains(readStringField(provider, "name"))
+                || ALLOWED_PROVIDER_IDENTITIES.contains(readStringField(provider, "authority"))
+                || ALLOWED_PROVIDER_IDENTITIES.contains(readStringField(provider, "packageName"))
+                || ALLOWED_PROVIDER_IDENTITIES.contains(readStringField(provider, "className"));
+    }
+
+    private static String providerName(Object provider) {
+        String name = readStringField(provider, "name");
+        if (name != null) {
+            return name;
         }
-        return out.append(']').toString();
+        String authority = readStringField(provider, "authority");
+        if (authority != null) {
+            return authority;
+        }
+        String className = readStringField(provider, "className");
+        return className == null ? "<unknown>" : className;
+    }
+
+    private static String readStringField(Object object, String fieldName) {
+        try {
+            Object value = XposedHelpers.getObjectField(object, fieldName);
+            return value instanceof String ? (String) value : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static String methodSignature(Method method) {
+        if (!DEBUG) {
+            return "";
+        }
+        return method.toGenericString();
     }
 
     private static String describe(Throwable error) {
