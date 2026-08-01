@@ -23,6 +23,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 public final class MiuiClipboardHook implements IXposedHookLoadPackage {
     private static final String TAG = "[MiuiClipboardHook] ";
     private static final boolean DEBUG = false;
+    private static final String OPTIMIZATION_KEY = "persist.sys.miui_optimization";
 
     private static final String CLIPBOARD_CLASS =
             "com.android.server.clipboard.ClipboardServiceStubImpl";
@@ -39,24 +40,97 @@ public final class MiuiClipboardHook implements IXposedHookLoadPackage {
     private static final Set<String> ALLOWED_PROVIDER_IDENTITIES = new HashSet<>(Arrays.asList(
             "com.miui.phrase.input.provider",
             "com.miui.provider.InputProvider",
-            "com.miui.mishare.connectivity",
-            "com.milink.service",
-            "com.xiaomi.mi_connect_service",
-            "com.xiaomi.mirror"));
+            "com.xiaomi.mirror.provider.CallProvider",
+            "com.miui.circulate.device.service.DeviceControlProvider"));
 
     private static final Set<String> HOOKED = new HashSet<>();
+    /* Static state is process-local under LSPosed; do not include packageName here. */
+    private static final Set<String> PROPERTY_HOOKED = new HashSet<>();
     private static final Set<String> LOGGED = new HashSet<>();
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-        if (!"android".equals(lpparam.packageName)) {
+        try {
+            if ("android".equals(lpparam.packageName)) {
+                installSystemServerHook(lpparam.classLoader);
+            } else if (CONTINUITY_PACKAGES.contains(lpparam.packageName)) {
+                installContinuityProcessHook(lpparam.classLoader, lpparam.packageName,
+                        lpparam.processName);
+            }
+        } catch (Throwable error) {
+            log("load hook failure package=" + lpparam.packageName
+                    + " process=" + lpparam.processName
+                    + " error=" + describe(error));
+        }
+    }
+
+    private static void installContinuityProcessHook(
+            ClassLoader loader, String packageName, String processName) {
+        log("loaded continuity package=" + packageName + " process=" + processName);
+        hookOptimizationProperty(loader, packageName, processName);
+    }
+
+    private static void hookOptimizationProperty(
+            ClassLoader loader, final String packageName, final String processName) {
+        Class<?> properties = XposedHelpers.findClassIfExists("android.os.SystemProperties", loader);
+        if (properties == null) {
+            log("SystemProperties not found package=" + packageName
+                    + " process=" + processName);
             return;
         }
 
+        hookPropertyGetter(properties, "getBoolean", packageName, processName);
+        hookPropertyGetter(properties, "get", packageName, processName);
+    }
+
+    private static void hookPropertyGetter(
+            Class<?> properties, final String methodName,
+            final String packageName, final String processName) {
+        String key = properties.getName() + "#" + methodName;
+        synchronized (PROPERTY_HOOKED) {
+            if (!PROPERTY_HOOKED.add(key)) {
+                debug("property hook already installed method=" + key
+                        + " process=" + processName);
+                return;
+            }
+        }
+
         try {
-            installSystemServerHook(lpparam.classLoader);
+            Set<XC_MethodHook.Unhook> unhooks = XposedBridge.hookAllMethods(
+                    properties,
+                    methodName,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            if (param.args == null || param.args.length == 0
+                                    || !OPTIMIZATION_KEY.equals(String.valueOf(param.args[0]))) {
+                                return;
+                            }
+
+                            if ("getBoolean".equals(methodName)
+                                    && param.getResult() instanceof Boolean
+                                    && !((Boolean) param.getResult())) {
+                                param.setResult(true);
+                                logOnce("property:boolean:" + processName,
+                                        "forced optimization=true package=" + packageName
+                                                + " process=" + processName
+                                                + " method=" + methodName);
+                            } else if ("get".equals(methodName)
+                                    && param.getResult() instanceof String
+                                    && "false".equalsIgnoreCase((String) param.getResult())) {
+                                param.setResult("true");
+                                logOnce("property:string:" + processName,
+                                        "forced optimization string=true package=" + packageName
+                                                + " process=" + processName
+                                                + " method=" + methodName);
+                            }
+                        }
+                    });
+            log("hooked property method=" + key + " overloads=" + unhooks.size()
+                    + " process=" + processName);
         } catch (Throwable error) {
-            log("system_server hook failure error=" + describe(error));
+            log("property hook failed=" + key + " process=" + processName
+                    + " error=" + describe(error));
         }
     }
 
@@ -156,7 +230,6 @@ public final class MiuiClipboardHook implements IXposedHookLoadPackage {
         }
         return ALLOWED_PROVIDER_IDENTITIES.contains(readStringField(provider, "name"))
                 || ALLOWED_PROVIDER_IDENTITIES.contains(readStringField(provider, "authority"))
-                || ALLOWED_PROVIDER_IDENTITIES.contains(readStringField(provider, "packageName"))
                 || ALLOWED_PROVIDER_IDENTITIES.contains(readStringField(provider, "className"));
     }
 
@@ -187,6 +260,12 @@ public final class MiuiClipboardHook implements IXposedHookLoadPackage {
             return "";
         }
         return method.toGenericString();
+    }
+
+    private static void debug(String message) {
+        if (DEBUG) {
+            log(message);
+        }
     }
 
     private static String describe(Throwable error) {

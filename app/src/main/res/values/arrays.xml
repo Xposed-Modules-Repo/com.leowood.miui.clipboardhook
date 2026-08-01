@@ -2,5 +2,9 @@
 <resources>
     <string-array name="xposed_scope">
         <item>android</item>
+        <item>com.miui.mishare.connectivity</item>
+        <item>com.milink.service</item>
+        <item>com.xiaomi.mi_connect_service</item>
+        <item>com.xiaomi.mirror</item>
     </string-array>
 </resources>
